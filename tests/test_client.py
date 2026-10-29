@@ -2,11 +2,15 @@
 Unit tests for Aeitron Python SDK using standard library unittest and http.server.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import sys
 import threading
+import time
 import unittest
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 
@@ -18,11 +22,25 @@ from aeitron import (
     ChatMessage,
     AeitronClient,
     AeitronError,
+    AuthenticationError,
+    PermissionDeniedError,
+    ApprovalRequiredError,
+    NotFoundError,
+    ConflictError,
+    ExpiredError,
+    ValidationError,
+    RateLimitError,
+    ServerError,
+    NetworkError,
+    WebhookSignature,
 )
 
 
 class MockServerHandler(BaseHTTPRequestHandler):
     """Mock HTTP Handler simulating Aeitron BFF Endpoints."""
+
+    transient_counter: int = 0
+    idempotent_post_counter: int = 0
 
     def log_message(self, format: str, *args) -> None:
         pass  # Suppress console logging during test runs
@@ -217,6 +235,38 @@ class MockServerHandler(BaseHTTPRequestHandler):
             }).encode("utf-8"))
             return
 
+        if self.path.startswith("/v1/test-typed-errors"):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            status_code = int(params.get("status", [200])[0])
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            if status_code == 429:
+                self.send_header("Retry-After", "12")
+            self.end_headers()
+            err_body = {
+                "error": f"Error status {status_code}",
+                "code": f"ERR_{status_code}",
+            }
+            if status_code == 422:
+                err_body["fields"] = {"ip": "bad"}
+            self.wfile.write(json.dumps(err_body).encode("utf-8"))
+            return
+
+        if self.path == "/v1/transient-test":
+            MockServerHandler.transient_counter += 1
+            if MockServerHandler.transient_counter < 3:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Service Unavailable", "code": "SERVICE_UNAVAILABLE"}).encode("utf-8"))
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True, "attempts": MockServerHandler.transient_counter}).encode("utf-8"))
+            return
+
         self.send_response(404)
         self.end_headers()
 
@@ -402,6 +452,52 @@ class MockServerHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(resp).encode("utf-8"))
             return
 
+        if self.path == "/v1/dns/request-deletion":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            resp = {
+                "requestId": "del_req_mock_123",
+                "domain": payload.get("domain"),
+                "recordId": payload.get("record_id"),
+                "requester": "sec_agent_1",
+                "status": "PENDING_APPROVAL",
+                "expiresAt": "2026-10-30T00:00:00Z",
+                "challengeToken": "tok_challenge_abc",
+            }
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            return
+
+        if self.path == "/v1/dns/approve-deletion":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            resp = {
+                "status": "APPROVED",
+                "requestId": payload.get("requestId"),
+                "approvedBy": payload.get("actor", "human_lead"),
+                "approvalToken": "tok_challenge_abc",
+                "validUntil": "2026-10-30T00:10:00Z",
+                "message": "Deletion approved",
+            }
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            return
+
+        if self.path == "/v1/idempotency-test":
+            idem_key = self.headers.get("Idempotency-Key")
+            MockServerHandler.idempotent_post_counter += 1
+            if MockServerHandler.idempotent_post_counter < 2:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Transient 503 error"}).encode("utf-8"))
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"received_key": idem_key, "attempts": MockServerHandler.idempotent_post_counter}).encode("utf-8"))
+            return
+
         self.send_response(404)
         self.end_headers()
 
@@ -410,6 +506,30 @@ class MockServerHandler(BaseHTTPRequestHandler):
         if auth_hdr != "Bearer nke_live_test_key_01":
             self.send_response(401)
             self.end_headers()
+            return
+
+        if "/v1/dns/zones/" in self.path and "/records/" in self.path:
+            parsed = urllib.parse.urlparse(self.path)
+            qs_params = urllib.parse.parse_qs(parsed.query)
+            confirm = qs_params.get("confirm", ["false"])[0] == "true"
+            token = qs_params.get("approval_token", [""])[0]
+
+            if not confirm or token != "tok_challenge_abc":
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "error": "APPROVAL_REQUIRED: Record deletion requires challenge approval",
+                    "requestId": "del_req_mock_123",
+                    "domain": "aeitron.io",
+                    "recordId": "rec_001",
+                }).encode("utf-8"))
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "DELETED", "record_id": "rec_001"}).encode("utf-8"))
             return
 
         if self.path == "/api/proxy/domains/dom_001":
@@ -782,6 +902,156 @@ class AeitronPythonSDKTests(unittest.TestCase):
             api_version="2026-01-01",
         )
         self.assertEqual(custom_client.api_version, "2026-01-01")
+
+    def test_specialized_typed_error_hierarchy(self) -> None:
+        """Verifies that specialized typed errors are thrown according to HTTP status code."""
+        # 400 Bad Request -> ValidationError
+        with self.assertRaises(ValidationError) as cm:
+            self.client.request("/v1/test-typed-errors?status=400")
+        self.assertEqual(cm.exception.status, 400)
+        self.assertIsInstance(cm.exception, ValidationError)
+
+        # 401 Unauthorized -> AuthenticationError
+        bad_auth_client = AeitronClient(api_key="nke_bad_key", base_url=self.base_url)
+        with self.assertRaises(AuthenticationError) as cm:
+            bad_auth_client.request("/api/proxy/domains")
+        self.assertEqual(cm.exception.status, 401)
+        self.assertIsInstance(cm.exception, AuthenticationError)
+
+        # 403 Forbidden -> PermissionDeniedError
+        with self.assertRaises(PermissionDeniedError) as cm:
+            self.client.request("/v1/test-typed-errors?status=403")
+        self.assertEqual(cm.exception.status, 403)
+        self.assertIsInstance(cm.exception, PermissionDeniedError)
+
+        # 404 Not Found -> NotFoundError
+        with self.assertRaises(NotFoundError) as cm:
+            self.client.request("/v1/test-typed-errors?status=404")
+        self.assertEqual(cm.exception.status, 404)
+        self.assertIsInstance(cm.exception, NotFoundError)
+
+        # 409 Conflict -> ConflictError
+        with self.assertRaises(ConflictError) as cm:
+            self.client.request("/v1/test-typed-errors?status=409")
+        self.assertEqual(cm.exception.status, 409)
+        self.assertIsInstance(cm.exception, ConflictError)
+
+        # 410 Gone -> ExpiredError
+        with self.assertRaises(ExpiredError) as cm:
+            self.client.request("/v1/test-typed-errors?status=410")
+        self.assertEqual(cm.exception.status, 410)
+        self.assertIsInstance(cm.exception, ExpiredError)
+
+        # 422 Unprocessable Entity -> ValidationError
+        with self.assertRaises(ValidationError) as cm:
+            self.client.request("/v1/test-typed-errors?status=422")
+        self.assertEqual(cm.exception.status, 422)
+        self.assertIsInstance(cm.exception, ValidationError)
+        self.assertIsNotNone(cm.exception.validation_errors)
+        self.assertEqual(cm.exception.validation_errors.get("fields"), {"ip": "bad"})
+
+        # 429 Rate Limit -> RateLimitError
+        with self.assertRaises(RateLimitError) as cm:
+            self.client.request("/v1/test-typed-errors?status=429")
+        self.assertEqual(cm.exception.status, 429)
+        self.assertIsInstance(cm.exception, RateLimitError)
+        self.assertEqual(cm.exception.retry_after_seconds, 12)
+
+        # 502 Bad Gateway -> ServerError
+        with self.assertRaises(ServerError) as cm:
+            self.client.request("/v1/test-typed-errors?status=502")
+        self.assertEqual(cm.exception.status, 502)
+        self.assertIsInstance(cm.exception, ServerError)
+
+    def test_dual_control_dns_deletion_workflow(self) -> None:
+        """Verifies dual-control human operator approval workflow for DNS deletions."""
+        # 1. Request deletion (Actor A)
+        req = self.client.dns.request_deletion(
+            domain="aeitron.io",
+            record_id="rec_001",
+            reason="Decommissioning legacy CNAME",
+        )
+        self.assertEqual(req["status"], "PENDING_APPROVAL")
+        self.assertEqual(req["requestId"], "del_req_mock_123")
+        self.assertEqual(req["challengeToken"], "tok_challenge_abc")
+
+        # 2. Operator approval (Actor B)
+        approved = self.client.dns.approve_deletion(
+            request_id=req["requestId"],
+            actor="operator_human_lead",
+        )
+        self.assertEqual(approved["status"], "APPROVED")
+        self.assertEqual(approved["approvalToken"], "tok_challenge_abc")
+
+        # 3. Complete deletion with approved token and confirm=True
+        del_res = self.client.dns.delete_record(
+            zone_id="zone_01",
+            record_id="rec_001",
+            approval_token=approved["approvalToken"],
+            confirm=True,
+        )
+        self.assertEqual(del_res["status"], "DELETED")
+        self.assertEqual(del_res["record_id"], "rec_001")
+
+    def test_challenge_guard_triggers_approval_required_error(self) -> None:
+        """Verifies that calling delete without approval triggers ApprovalRequiredError."""
+        with self.assertRaises(ApprovalRequiredError) as cm:
+            self.client.dns.delete_record("zone_01", "rec_001", confirm=False)
+        self.assertEqual(cm.exception.status, 403)
+        self.assertEqual(cm.exception.challenge_request_id, "del_req_mock_123")
+        self.assertEqual(cm.exception.domain, "aeitron.io")
+        self.assertEqual(cm.exception.record_id, "rec_001")
+
+    def test_webhook_signature_verification_and_anti_replay(self) -> None:
+        """Verifies HMAC-SHA256 signature verification and replay prevention."""
+        secret = "whsec_test_secret_key_888"
+        payload = json.dumps({"event": "dns.record.updated", "zone": "aeitron.io"})
+        now = int(time.time())
+
+        # 1. Valid signature
+        signed_payload = f"{now}.{payload}".encode("utf-8")
+        sig = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+        valid_header = f"t={now},v1={sig}"
+
+        self.assertTrue(WebhookSignature.verify(payload, valid_header, secret))
+
+        # 2. Tampered body
+        tampered_payload = json.dumps({"event": "dns.record.updated", "zone": "malicious.com"})
+        with self.assertRaises(AuthenticationError):
+            WebhookSignature.verify(tampered_payload, valid_header, secret)
+
+        # 3. Wrong secret
+        with self.assertRaises(AuthenticationError):
+            WebhookSignature.verify(payload, valid_header, "whsec_wrong_secret")
+
+        # 4. Replay attack with timestamp outside 300s tolerance
+        stale_time = now - 600
+        stale_signed = f"{stale_time}.{payload}".encode("utf-8")
+        stale_sig = hmac.new(secret.encode("utf-8"), stale_signed, hashlib.sha256).hexdigest()
+        stale_header = f"t={stale_time},v1={stale_sig}"
+
+        with self.assertRaises(ValidationError) as cm:
+            WebhookSignature.verify(payload, stale_header, secret, tolerance_seconds=300)
+        self.assertIn("tolerance", str(cm.exception).lower())
+
+    def test_automatic_retries_on_transient_503_errors(self) -> None:
+        """Verifies automatic retry loop on transient 503 errors."""
+        MockServerHandler.transient_counter = 0
+        data, headers = self.client.request("/v1/transient-test", method="GET")
+        self.assertTrue(data.get("success"))
+        self.assertEqual(data.get("attempts"), 3)
+
+    def test_idempotency_key_enables_retry_on_post(self) -> None:
+        """Verifies Idempotency-Key header is transmitted and allows safe retry on POST."""
+        MockServerHandler.idempotent_post_counter = 0
+        data, headers = self.client.request(
+            "/v1/idempotency-test",
+            method="POST",
+            body={"action": "test"},
+            idempotency_key="idemp_key_test_777",
+        )
+        self.assertEqual(data.get("received_key"), "idemp_key_test_777")
+        self.assertEqual(data.get("attempts"), 2)
 
 
 if __name__ == "__main__":

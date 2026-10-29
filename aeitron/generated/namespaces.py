@@ -85,6 +85,33 @@ class DNSNamespace(BaseGeneratedNamespace):
     def create_record(self, zone_id: str, record: Dict[str, Any]) -> Dict[str, Any]:
         return self._call(f"/v1/dns/zones/{quote(zone_id)}/records", method="POST", body=record)
 
+    def request_deletion(self, domain: str, record_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"domain": domain, "record_id": record_id}
+        if reason:
+            body["reason"] = reason
+        return self._call("/v1/dns/request-deletion", method="POST", body=body)
+
+    def approve_deletion(self, request_id: str, actor: Optional[str] = None) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"requestId": request_id}
+        if actor:
+            body["actor"] = actor
+        return self._call("/v1/dns/approve-deletion", method="POST", body=body)
+
+    def delete_record(
+        self,
+        zone_id: str,
+        record_id: str,
+        approval_token: Optional[str] = None,
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if confirm:
+            params["confirm"] = "true"
+        if approval_token:
+            params["approval_token"] = approval_token
+        qs = f"?{urlencode(params)}" if params else ""
+        return self._call(f"/v1/dns/zones/{quote(zone_id)}/records/{quote(record_id)}{qs}", method="DELETE")
+
 class ComputeNamespace(BaseGeneratedNamespace):
     def list_instances(self) -> Dict[str, Any]:
         return self._call("/v1/compute/instances", method="GET")

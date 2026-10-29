@@ -6,7 +6,11 @@ Multi-Objective AI Orchestration, Custom Domains, and Telemetry.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import random
+import re
 import socket
 import ssl
 import time
@@ -15,7 +19,19 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from .exceptions import AeitronError
+from .exceptions import (
+    AeitronError,
+    AuthenticationError,
+    PermissionDeniedError,
+    ApprovalRequiredError,
+    NotFoundError,
+    ConflictError,
+    ExpiredError,
+    ValidationError,
+    RateLimitError,
+    ServerError,
+    NetworkError,
+)
 from .types import (
     ChatMessage,
     CompletionChoice,
@@ -55,6 +71,62 @@ from .generated.namespaces import (
 )
 
 
+class WebhookSignature:
+    """Enterprise HMAC-SHA256 signature verification for Aeitron Webhooks."""
+
+    @staticmethod
+    def verify(
+        payload: str,
+        signature_header: str,
+        secret: str,
+        tolerance_seconds: int = 300,
+    ) -> bool:
+        if not signature_header or not isinstance(signature_header, str):
+            raise ValidationError("Missing Aeitron-Signature webhook header.", "MISSING_SIGNATURE")
+        if not secret or not isinstance(secret, str):
+            raise ValidationError("Webhook verification secret must not be empty.", "MISSING_SECRET")
+
+        timestamp: Optional[int] = None
+        signatures: List[str] = []
+
+        parts = signature_header.split(",")
+        for part in parts:
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            key, val = part.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if key == "t":
+                try:
+                    timestamp = int(val)
+                except ValueError:
+                    pass
+            elif key == "v1":
+                signatures.append(val)
+
+        if timestamp is None:
+            raise ValidationError("Invalid Aeitron-Signature header format: missing timestamp 't'.", "INVALID_SIGNATURE_HEADER")
+        if not signatures:
+            raise ValidationError("Invalid Aeitron-Signature header format: missing signature 'v1'.", "INVALID_SIGNATURE_HEADER")
+
+        now = int(time.time())
+        if tolerance_seconds > 0 and abs(now - timestamp) > tolerance_seconds:
+            raise ValidationError(
+                f"Webhook signature timestamp outside acceptable tolerance ({tolerance_seconds}s). Potential replay attack.",
+                "REPLAY_DETECTED",
+            )
+
+        signed_payload = f"{timestamp}.{payload}".encode("utf-8")
+        expected_sig = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+
+        for sig in signatures:
+            if hmac.compare_digest(sig.encode("utf-8"), expected_sig.encode("utf-8")):
+                return True
+
+        raise AuthenticationError("Webhook signature verification failed. Computed signature does not match header.")
+
+
 class AeitronClient:
     """Official Aeitron API Client."""
 
@@ -65,15 +137,19 @@ class AeitronClient:
         api_version: str = "2026-11-01",
         timeout_seconds: float = 30.0,
         verify_ssl: bool = True,
+        max_retries: int = 2,
+        default_headers: Optional[Dict[str, str]] = None,
     ) -> None:
         if not api_key or not isinstance(api_key, str) or not api_key.strip():
-            raise AeitronError(400, "AeitronClient requires a valid API key (e.g., nke_live_...)", "INVALID_API_KEY")
+            raise ValidationError("AeitronClient requires a valid API key (e.g., nke_live_...)", "INVALID_API_KEY")
 
         self.api_key: str = api_key.strip()
         self.base_url: str = base_url.rstrip("/")
         self.api_version: str = (api_version or "2026-11-01").strip()
         self.timeout_seconds: float = max(0.1, float(timeout_seconds))
         self.verify_ssl: bool = verify_ssl
+        self.max_retries: int = max(0, int(max_retries))
+        self.default_headers: Dict[str, str] = default_headers or {}
 
         self.inference = InferenceNamespace(self)
         self.domains = DomainsNamespace(self)
@@ -96,16 +172,28 @@ class AeitronClient:
         self.fleet = FleetNamespace(self)
         self.audit = AuditNamespace(self)
 
+    def _backoff(self, attempt: int, retry_after: int) -> None:
+        """Applies exponential backoff with full jitter or honors Retry-After."""
+        if retry_after > 0:
+            time.sleep(min(float(retry_after), 10.0))
+            return
+        base = 0.05 * (2 ** attempt)
+        jitter = random.uniform(0.01, 0.05)
+        delay = min(base + jitter, 2.0)
+        time.sleep(delay)
+
     def request(
         self,
         endpoint: str,
         method: str = "GET",
         body: Optional[Any] = None,
         headers: Optional[Dict[str, str]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Tuple[Any, Dict[str, str]]:
-        """Executes an authenticated HTTP request against Aeitron APIs."""
+        """Executes an authenticated HTTP request against Aeitron APIs with retries and typed errors."""
         endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
         full_url = f"{self.base_url}{endpoint}"
+        normalized_method = method.upper()
 
         req_headers: Dict[str, str] = {
             "Accept": "application/json",
@@ -114,60 +202,156 @@ class AeitronClient:
             "Aeitron-Version": self.api_version,
             "User-Agent": "Aeitron-Python-SDK/0.1.0",
         }
+        if self.default_headers:
+            req_headers.update(self.default_headers)
         if headers:
             req_headers.update(headers)
+
+        effective_idempotency_key = (
+            idempotency_key
+            or req_headers.get("Idempotency-Key")
+            or req_headers.get("idempotency-key")
+        )
+        if effective_idempotency_key:
+            req_headers["Idempotency-Key"] = str(effective_idempotency_key)
+
+        is_idempotent = normalized_method in ("GET", "HEAD", "OPTIONS", "PUT", "DELETE") or bool(effective_idempotency_key)
 
         req_data: Optional[bytes] = None
         if body is not None:
             req_headers["Content-Type"] = "application/json"
             req_data = json.dumps(body).encode("utf-8")
 
-        req = urllib.request.Request(full_url, data=req_data, headers=req_headers, method=method.upper())
         ssl_ctx = None if self.verify_ssl else ssl._create_unverified_context()
+        max_attempts = (self.max_retries + 1) if is_idempotent else 1
+        last_network_error: Optional[Exception] = None
 
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=ssl_ctx) as resp:
-                resp_bytes = resp.read()
-                raw_headers = dict(resp.headers.items())
-                norm_headers = {k.lower(): v for k, v in raw_headers.items()}
+        for attempt in range(max_attempts):
+            req = urllib.request.Request(full_url, data=req_data, headers=req_headers, method=normalized_method)
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=ssl_ctx) as resp:
+                    resp_bytes = resp.read()
+                    raw_headers = dict(resp.headers.items())
+                    norm_headers = {k.lower(): v for k, v in raw_headers.items()}
 
-                if not resp_bytes:
-                    return None, norm_headers
+                    if not resp_bytes:
+                        return None, norm_headers
 
-                try:
-                    parsed_json = json.loads(resp_bytes.decode("utf-8"))
-                except Exception:
-                    parsed_json = {"raw": resp_bytes.decode("utf-8", errors="replace")}
+                    try:
+                        parsed_json = json.loads(resp_bytes.decode("utf-8"))
+                    except Exception:
+                        parsed_json = {"raw": resp_bytes.decode("utf-8", errors="replace")}
 
-                return parsed_json, norm_headers
+                    return parsed_json, norm_headers
 
-        except urllib.error.HTTPError as e:
-            err_bytes = e.read()
-            err_json: Any = None
-            if err_bytes:
-                try:
-                    err_json = json.loads(err_bytes.decode("utf-8"))
-                except Exception:
-                    err_json = {"raw": err_bytes.decode("utf-8", errors="replace")}
+            except urllib.error.HTTPError as e:
+                err_bytes = e.read()
+                err_json: Any = None
+                if err_bytes:
+                    try:
+                        err_json = json.loads(err_bytes.decode("utf-8"))
+                    except Exception:
+                        err_json = {"raw": err_bytes.decode("utf-8", errors="replace")}
 
-            msg = f"HTTP {e.code}: {e.reason}"
-            code: Union[str, int] = e.code
-            if isinstance(err_json, dict):
-                msg = err_json.get("error") or err_json.get("message") or msg
-                code = err_json.get("code") or err_json.get("error_code") or code
+                # Retryable status codes on idempotent requests
+                if attempt < max_attempts - 1 and (e.code == 429 or 500 <= e.code <= 504):
+                    retry_after = 0
+                    if hasattr(e, "headers") and e.headers:
+                        try:
+                            retry_after = int(e.headers.get("Retry-After", "0"))
+                        except ValueError:
+                            pass
+                    self._backoff(attempt, retry_after)
+                    continue
 
-            raise AeitronError(e.code, str(msg), code=code, details=err_json) from e
+                msg = f"HTTP {e.code}: {e.reason}"
+                code: Union[str, int] = e.code
+                if isinstance(err_json, dict):
+                    msg = err_json.get("error") or err_json.get("message") or err_json.get("error_description") or msg
+                    code = err_json.get("code") or err_json.get("error_code") or code
 
-        except (socket.timeout, TimeoutError) as e:
-            raise AeitronError(504, f"Request timed out after {self.timeout_seconds}s", "TIMEOUT") from e
+                msg_str = str(msg)
+                has_req_id = isinstance(err_json, dict) and bool(err_json.get("requestId"))
 
-        except urllib.error.URLError as e:
-            if isinstance(e.reason, (socket.timeout, TimeoutError)):
-                raise AeitronError(504, f"Request timed out after {self.timeout_seconds}s", "TIMEOUT") from e
-            raise AeitronError(500, f"Network request failed: {e.reason}", "NETWORK_ERROR") from e
+                # Dual-Control DNS Deletion / Safety Challenge Detection
+                if has_req_id or ("del_req_" in msg_str.lower()):
+                    challenge_req_id = ""
+                    if has_req_id and isinstance(err_json, dict):
+                        challenge_req_id = str(err_json["requestId"])
+                    else:
+                        m = re.search(r"del_req_[a-f0-9]+", msg_str, re.IGNORECASE)
+                        if m:
+                            challenge_req_id = m.group(0)
+                    domain = err_json.get("domain") if isinstance(err_json, dict) else None
+                    record_id = err_json.get("recordId") if isinstance(err_json, dict) else None
+                    raise ApprovalRequiredError(
+                        message=msg_str,
+                        challenge_request_id=challenge_req_id,
+                        domain=domain,
+                        record_id=record_id,
+                        details=err_json,
+                    ) from e
 
-        except Exception as e:
-            raise AeitronError(500, str(e), "CLIENT_ERROR") from e
+                if e.code == 400:
+                    raise ValidationError(msg_str, code=code, details=err_json, status=400) from e
+                elif e.code == 401:
+                    raise AuthenticationError(msg_str, code=code, details=err_json) from e
+                elif e.code == 403:
+                    raise PermissionDeniedError(msg_str, code=code, details=err_json) from e
+                elif e.code == 404:
+                    raise NotFoundError(msg_str, code=code, details=err_json) from e
+                elif e.code == 409:
+                    raise ConflictError(msg_str, code=code, details=err_json) from e
+                elif e.code == 410:
+                    raise ExpiredError(msg_str, code=code, details=err_json) from e
+                elif e.code == 422:
+                    raise ValidationError(msg_str, code=code, details=err_json, status=422) from e
+                elif e.code == 429:
+                    retry_after = 0
+                    if hasattr(e, "headers") and e.headers:
+                        try:
+                            retry_after = int(e.headers.get("Retry-After", "0"))
+                        except ValueError:
+                            pass
+                    raise RateLimitError(
+                        msg_str,
+                        retry_after_seconds=retry_after if retry_after > 0 else None,
+                        code=code,
+                        details=err_json,
+                    ) from e
+                elif e.code >= 500:
+                    raise ServerError(e.code, msg_str, code=code, details=err_json) from e
+                else:
+                    raise AeitronError(e.code, msg_str, code=code, details=err_json) from e
+
+            except (socket.timeout, TimeoutError) as e:
+                last_network_error = e
+                if is_idempotent and attempt < max_attempts - 1:
+                    self._backoff(attempt, 0)
+                    continue
+                raise NetworkError(f"Request timed out after {self.timeout_seconds}s", "TIMEOUT", status=504) from e
+
+            except urllib.error.URLError as e:
+                last_network_error = e
+                if isinstance(e.reason, (socket.timeout, TimeoutError)):
+                    if is_idempotent and attempt < max_attempts - 1:
+                        self._backoff(attempt, 0)
+                        continue
+                    raise NetworkError(f"Request timed out after {self.timeout_seconds}s", "TIMEOUT", status=504) from e
+                if is_idempotent and attempt < max_attempts - 1:
+                    self._backoff(attempt, 0)
+                    continue
+                raise NetworkError(f"Network request failed: {e.reason}", "NETWORK_ERROR", status=0) from e
+
+            except AeitronError:
+                raise
+
+            except Exception as e:
+                raise AeitronError(500, str(e), "CLIENT_ERROR") from e
+
+        if last_network_error:
+            raise NetworkError(str(last_network_error), "NETWORK_ERROR") from last_network_error
+        raise NetworkError("Request failed after retries", "RETRY_EXHAUSTED")
 
 
 class InferenceNamespace:
@@ -184,10 +368,11 @@ class InferenceNamespace:
         jurisdiction: Optional[Jurisdiction] = None,
         temperature: float = 0.7,
         max_tokens: int = 1024,
+        idempotency_key: Optional[str] = None,
     ) -> CompletionResponse:
         """Executes multi-objective LLM inference through Aeitron Edge Gateway."""
         if not messages or not isinstance(messages, list):
-            raise AeitronError(400, "create_completion requires a non-empty messages list", "INVALID_PARAMS")
+            raise ValidationError("create_completion requires a non-empty messages list", "INVALID_PARAMS")
 
         formatted_messages = []
         for msg in messages:
@@ -196,7 +381,7 @@ class InferenceNamespace:
             elif isinstance(msg, dict):
                 formatted_messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
             else:
-                raise AeitronError(400, "Invalid message item; must be ChatMessage or dict", "INVALID_PARAMS")
+                raise ValidationError("Invalid message item; must be ChatMessage or dict", "INVALID_PARAMS")
 
         extra_headers: Dict[str, str] = {}
         if routing_strategy:
@@ -216,6 +401,7 @@ class InferenceNamespace:
             method="POST",
             body=payload,
             headers=extra_headers,
+            idempotency_key=idempotency_key,
         )
 
         cost_hdr = headers.get("x-aeitron-cost")

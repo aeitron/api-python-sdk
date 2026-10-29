@@ -177,3 +177,22 @@ class TracingStats:
     slow_threshold_ms: Optional[int] = None
     slow_traces_total: Optional[int] = None
 
+@dataclass
+class DnsDeletionRequest:
+    requestId: str
+    domain: str
+    recordId: str
+    requester: str
+    status: str
+    expiresAt: str
+    challengeToken: str
+
+@dataclass
+class DnsApprovalResult:
+    status: str
+    requestId: str
+    approvedBy: str
+    approvalToken: str
+    validUntil: str
+    message: str
+
